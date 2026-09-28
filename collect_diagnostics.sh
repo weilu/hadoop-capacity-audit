@@ -47,6 +47,7 @@ section() {
     echo "Collecting: $1" >&2
 }
 
+# For fixed commands written in this script only; never pass values read from the system.
 run() {
     printf '\n$ %s\n' "$1"
     # stdin from /dev/null: tools like beeline otherwise consume the table list being looped over
@@ -54,13 +55,38 @@ run() {
     printf '[exit code: %s]\n' "$?"
 }
 
+# For commands that include values read from the system (table names, HDFS paths).
+# The command runs as an argument list, without a shell, so those values cannot inject
+# commands. Usage: run_args <filter> cmd arg...  (filter: a fixed pipe stage such as
+# "head -40", or "" for none).
+run_args() {
+    local filter="$1" rc
+    shift
+    printf '\n$ %s%s\n' "$(printf '%q ' "$@")" "${filter:+| $filter}"
+    if [[ -n "$filter" ]]; then
+        timeout "$TIMEOUT" "$@" </dev/null 2>&1 | bash -c "$filter"
+        rc=${PIPESTATUS[0]}
+    else
+        timeout "$TIMEOUT" "$@" </dev/null 2>&1
+        rc=$?
+    fi
+    printf '[exit code: %s]\n' "$rc"
+}
+
 beeline_q() {
     timeout "$TIMEOUT" beeline -u "$BEELINE_URL" -n "$HIVE_USER" --silent=true --outputformat=tsv2 -e "$1" </dev/null 2>/dev/null
 }
 
-hive_sql() {
-    echo "beeline -u '$BEELINE_URL' -n $HIVE_USER --silent=true --outputformat=tsv2 -e \"$1\""
+run_sql() {
+    local filter="$1"
+    shift
+    run_args "$filter" beeline -u "$BEELINE_URL" -n "$HIVE_USER" --silent=true --outputformat=tsv2 -e "$1"
 }
+
+# Hive identifiers and HDFS paths come from other users' data; skip anything unusual
+# rather than risk passing it on.
+valid_identifier() { [[ "$1" =~ ^[A-Za-z0-9_]+$ ]]; }
+valid_hdfs_path() { [[ "$1" =~ ^(hdfs://[A-Za-z0-9._:-]+)?/[A-Za-z0-9._/=:@+,-]*$ ]]; }
 
 {
     echo "Hadoop capacity audit: collected output"
@@ -116,41 +142,55 @@ hive_sql() {
 
         section "C2 HDFS space by directory, raw copies and leftovers"
         run "hdfs dfs -du -h /"
-        run "for d in \$(hdfs dfs -ls / | awk '/^d/{print \$NF}'); do echo \"--- \$d\"; hdfs dfs -du -h \$d; done"
+        run "hdfs dfs -ls / | awk '/^d/{print \$NF}' | while read -r d; do echo \"--- \$d\"; hdfs dfs -du -h \"\$d\" </dev/null; done"
         run "hdfs dfs -du -s -h /tmp '/user/*/.Trash'"
         run "hdfs dfs -ls -R / 2>/dev/null | grep -iE '\\.(csv|txt|gz|zip)\$' | head -50"
 
         section "C3 Hive databases and tables"
         TABLE_LIST=$(mktemp)
         beeline_q "SHOW DATABASES;" | grep -v '^database_name$' | while read -r db; do
-            beeline_q "SHOW TABLES IN \`$db\`;" | grep -v '^tab_name$' | sed "s/^/$db./"
+            valid_identifier "$db" || { printf 'Skipping database with unexpected name: %q\n' "$db" >&2; continue; }
+            beeline_q "SHOW TABLES IN \`$db\`;" | grep -v '^tab_name$' | while read -r t; do
+                if valid_identifier "$t"; then echo "$db.$t"; else printf 'Skipping table with unexpected name: %q\n' "$db.$t" >&2; fi
+            done
         done > "$TABLE_LIST"
-        run "$(hive_sql 'SHOW DATABASES;')"
+        run_sql "" "SHOW DATABASES;"
         printf '\nTables found:\n'
         cat "$TABLE_LIST"
         while read -r tbl; do
-            run "$(hive_sql "DESCRIBE FORMATTED $tbl;")"
-            run "$(hive_sql "SHOW PARTITIONS $tbl;") | sed -n '1,3p;\$p'"
+            run_sql "" "DESCRIBE FORMATTED \`${tbl%%.*}\`.\`${tbl#*.}\`;"
+            run_sql "sed -n '1,3p;\$p'" "SHOW PARTITIONS \`${tbl%%.*}\`.\`${tbl#*.}\`;"
         done < "$TABLE_LIST"
 
         section "C4 ORC compression"
         if [[ -z "$ORC_FILE" ]]; then
             ORC_FILE=$(timeout "$TIMEOUT" hdfs dfs -ls -R /user/hive/warehouse /warehouse </dev/null 2>/dev/null \
                 | awk '!/^d/ && $5 > 1000000 {print $NF; exit}')
-            echo "ORC_FILE not set; using the first data file over 1MB found (may not be from a main table): ${ORC_FILE:-none}"
+            printf 'ORC_FILE not set; using the first data file over 1MB found (may not be from a main table): %q\n' "${ORC_FILE:-none}"
         fi
-        [[ -n "$ORC_FILE" ]] && run "hive --orcfiledump $ORC_FILE | head -40"
+        if [[ -n "$ORC_FILE" ]]; then
+            if valid_hdfs_path "$ORC_FILE"; then
+                run_args "head -40" hive --orcfiledump "$ORC_FILE"
+            else
+                printf 'Skipping ORC file with unexpected characters in its path: %q\n' "$ORC_FILE"
+            fi
+        fi
 
         section "C5 Hive execution engine and join settings"
-        run "$(hive_sql 'SET hive.execution.engine; SET hive.auto.convert.join; SET hive.auto.convert.join.noconditionaltask.size; SET hive.stats.autogather;')"
+        run_sql "" "SET hive.execution.engine; SET hive.auto.convert.join; SET hive.auto.convert.join.noconditionaltask.size; SET hive.stats.autogather;"
 
         section "C6 Failed and killed jobs"
         run "yarn application -list -appStates FAILED,KILLED 2>/dev/null | head -50"
 
         section "C7 Size per partition (daily volume and growth)"
         while read -r tbl; do
-            loc=$(beeline_q "DESCRIBE FORMATTED $tbl;" | awk -F'\t' '/^Location/{print $2; exit}' | tr -d ' ')
-            [[ -n "$loc" ]] && run "hdfs dfs -du $loc"
+            loc=$(beeline_q "DESCRIBE FORMATTED \`${tbl%%.*}\`.\`${tbl#*.}\`;" | awk -F'\t' '/^Location/{print $2; exit}' | tr -d ' ')
+            [[ -z "$loc" ]] && continue
+            if valid_hdfs_path "$loc"; then
+                run_args "" hdfs dfs -du "$loc"
+            else
+                printf '\nSkipping %s: location has unexpected characters: %q\n' "$tbl" "$loc"
+            fi
         done < "$TABLE_LIST"
         rm -f "$TABLE_LIST"
     fi

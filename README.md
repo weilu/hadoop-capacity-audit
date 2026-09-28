@@ -74,6 +74,7 @@ exit
 
 - All commands are read-only. Nothing on the system is changed.
 - No table rows are read; only metadata, sizes and configuration.
+- Values read from the cluster (database and table names, table locations, file paths) are passed to commands directly, never through a shell, so they cannot inject commands when the script runs as root. Names or paths with unexpected characters are skipped and noted in the output.
 - A failing command does not stop the script: its exit code is recorded and the script continues. Each command is stopped after `TIMEOUT` seconds.
 - Only specific configuration keys are read from Hadoop config files, never whole files, to avoid capturing passwords.
 - The output contains hostnames, IP addresses, file paths, table names and sizes. Review it before sharing.
