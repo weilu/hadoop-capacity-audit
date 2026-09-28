@@ -1,6 +1,6 @@
 # hadoop-capacity-audit
 
-A read-only diagnostics script for on-premises Hadoop / HDFS / Hive clusters. It collects the information needed to assess storage capacity, find space that can be reclaimed, and plan hardware upgrades.
+A read-only diagnostics script for on-premises Hadoop / HDFS / Hive clusters. It collects the information needed to assess storage capacity, find space that can be reclaimed, identify which resource (disk, network, memory or CPU) limits processing, and plan hardware upgrades.
 
 Every command is written to a single text file together with its output and exit code, so the results can be reviewed by someone without access to the servers.
 
@@ -16,9 +16,10 @@ Output is grouped under sections with stable IDs, so results can be mapped to yo
 | H2 | OS, Hadoop and Hive versions; distribution |
 | H3 | Server model and serial number |
 | H4 | Disks, drive bays and RAID layout (HPE Smart Array via `ssacli`) |
-| H5 | Network interfaces, link speed, bonding; PCIe slots |
+| H5 | Network interfaces, card model, port type, link speed, bonding; PCIe/OCP slots; switch neighbour (if `lldpctl` is available) |
 | H6 | Local disk usage, HDFS data directories, temporary file locations |
 | H7 | Memory and CPU available to YARN; running Hadoop services |
+| H8 | Memory modules: size, type, speed; slots filled and empty |
 
 **Once per cluster (`--cluster`)**
 
@@ -32,6 +33,16 @@ Output is grouped under sections with stable IDs, so results can be mapped to yo
 | C6 | Failed and killed YARN applications |
 | C7 | Size of every partition of every table (for volume and growth estimates) |
 
+**During a heavy job (`--monitor <minutes>`)**
+
+Written to a separate file, `capacity_audit_monitor_<hostname>_<date>.txt`.
+
+| ID | Section |
+|---|---|
+| M1 | CPU and memory usage (`vmstat`) |
+| M2 | Disk activity (`iostat`, or `/proc/diskstats` if sysstat is not installed) |
+| M3 | Network traffic per interface (`sar`, or `/proc/net/dev` if sysstat is not installed) |
+
 ## Usage
 
 Review the script first, and set the environment variables below if the defaults do not match your cluster. Adjust commands if needed.
@@ -42,6 +53,9 @@ sudo bash collect_diagnostics.sh
 
 # On one machine only (e.g. the NameNode), add the cluster-wide checks
 sudo bash collect_diagnostics.sh --cluster
+
+# On each machine at the same time, while a representative heavy job runs
+sudo bash collect_diagnostics.sh --monitor 30
 
 # With custom settings
 sudo HIVE_USER=analyst BEELINE_URL='jdbc:hive2://hive-host:10000' bash collect_diagnostics.sh --cluster
@@ -57,6 +71,7 @@ Output: `capacity_audit_<hostname>_<date>.txt` in the current directory. Run it 
 | `HADOOP_CONF_DIR` | `/etc/hadoop/conf` | Hadoop configuration directory |
 | `ORC_FILE` | *(auto)* | HDFS path of one ORC file from a main table; if unset, the first data file over 1MB in the Hive warehouse is used |
 | `TIMEOUT` | `900` | Seconds before a single command is stopped |
+| `INTERVAL` | `5` | Seconds between samples in `--monitor` mode |
 
 **Kerberos:** if the cluster uses Kerberos, run `kinit` as an administrative principal before the script; `HDFS_USER` then has no effect.
 

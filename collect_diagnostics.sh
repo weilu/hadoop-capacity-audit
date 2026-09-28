@@ -2,14 +2,19 @@
 # Collects read-only diagnostics from a Hadoop / HDFS / Hive cluster for storage
 # capacity assessment and hardware upgrade planning.
 # Every command is recorded together with its output and exit code, under section
-# headers with stable IDs (H1-H7 per machine, C1-C7 per cluster).
+# headers with stable IDs (H1-H8 per machine, C1-C7 per cluster, M1-M3 monitoring).
 #
 # Usage:
 #   On EACH machine:                         sudo bash collect_diagnostics.sh
 #   On ONE machine only (e.g. the NameNode): sudo bash collect_diagnostics.sh --cluster
+#   On EACH machine, during a heavy job:     sudo bash collect_diagnostics.sh --monitor <minutes>
 #
 # The --cluster option adds the HDFS, Hive and YARN checks. They describe the
 # whole cluster, so running them once is enough.
+#
+# The --monitor option only records CPU, memory, disk and network usage every
+# INTERVAL seconds for the given number of minutes. Start it on every machine at
+# the same time as a representative heavy job, to see which resource limits it.
 #
 # Settings (override as environment variables if the defaults do not match):
 #   HDFS_USER        user with HDFS superuser rights             (default: hdfs)
@@ -18,6 +23,7 @@
 #   HADOOP_CONF_DIR  Hadoop configuration directory              (default: /etc/hadoop/conf)
 #   ORC_FILE         HDFS path of one ORC file from a main table (optional)
 #   TIMEOUT          seconds before a single command is stopped  (default: 900)
+#   INTERVAL         seconds between samples in --monitor mode   (default: 5)
 #
 # If the cluster uses Kerberos, run `kinit` as an administrative principal first;
 # HDFS_USER then has no effect.
@@ -33,9 +39,21 @@ BEELINE_URL="${BEELINE_URL:-jdbc:hive2://localhost:10000}"
 HADOOP_CONF_DIR="${HADOOP_CONF_DIR:-/etc/hadoop/conf}"
 ORC_FILE="${ORC_FILE:-}"
 TIMEOUT="${TIMEOUT:-900}"
+INTERVAL="${INTERVAL:-5}"
 
 CLUSTER=0
-[[ "${1:-}" == "--cluster" ]] && CLUSTER=1
+MONITOR_MINUTES=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cluster) CLUSTER=1 ;;
+        --monitor)
+            MONITOR_MINUTES="${2:-}"
+            [[ "$MONITOR_MINUTES" =~ ^[1-9][0-9]*$ ]] || { echo "Usage: --monitor <minutes>" >&2; exit 1; }
+            shift ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
 
 # Hadoop commands run as HDFS_USER (simple authentication), since some reports need HDFS superuser rights.
 export HADOOP_USER_NAME="$HDFS_USER"
@@ -88,6 +106,56 @@ run_sql() {
 valid_identifier() { [[ "$1" =~ ^[A-Za-z0-9_]+$ ]]; }
 valid_hdfs_path() { [[ "$1" =~ ^(hdfs://[A-Za-z0-9._:-]+)?/[A-Za-z0-9._/=:@+,-]*$ ]]; }
 
+monitor() {
+    local samples=$(( MONITOR_MINUTES * 60 / INTERVAL ))
+    local out="capacity_audit_monitor_$(hostname -s)_$(date +%Y%m%d_%H%M).txt"
+    local tmp
+    tmp=$(mktemp -d)
+    echo "Monitoring for $MONITOR_MINUTES minutes ($samples samples every ${INTERVAL}s). Start the heavy job now." >&2
+
+    vmstat -t "$INTERVAL" "$samples" > "$tmp/m1" 2>&1 &
+    if command -v iostat >/dev/null; then
+        iostat -dxmt "$INTERVAL" "$samples" > "$tmp/m2" 2>&1 &
+        M2_CMD="iostat -dxmt $INTERVAL $samples"
+    else
+        (for ((i = 0; i < samples; i++)); do date '+%F %T'; cat /proc/diskstats; sleep "$INTERVAL"; done) > "$tmp/m2" 2>&1 &
+        M2_CMD="(iostat not installed) /proc/diskstats every ${INTERVAL}s"
+    fi
+    if command -v sar >/dev/null; then
+        sar -n DEV "$INTERVAL" "$samples" > "$tmp/m3" 2>&1 &
+        M3_CMD="sar -n DEV $INTERVAL $samples"
+    else
+        (for ((i = 0; i < samples; i++)); do date '+%F %T'; cat /proc/net/dev; sleep "$INTERVAL"; done) > "$tmp/m3" 2>&1 &
+        M3_CMD="(sar not installed) /proc/net/dev every ${INTERVAL}s"
+    fi
+    wait
+
+    {
+        echo "Hadoop capacity audit: resource usage during a job"
+        echo "Host: $(hostname -f 2>/dev/null || hostname)"
+        echo "Started: $(date -d "-$MONITOR_MINUTES min" 2>/dev/null || echo "$MONITOR_MINUTES minutes before end")"
+        echo "Ended: $(date)"
+        section "M1 CPU and memory" 2>/dev/null
+        printf '\n$ vmstat -t %s %s\n' "$INTERVAL" "$samples"
+        cat "$tmp/m1"
+        section "M2 Disk activity" 2>/dev/null
+        printf '\n$ %s\n' "$M2_CMD"
+        cat "$tmp/m2"
+        section "M3 Network traffic" 2>/dev/null
+        printf '\n$ %s\n' "$M3_CMD"
+        cat "$tmp/m3"
+        echo
+        echo "==================== Done ===================="
+    } > "$out"
+    rm -rf "$tmp"
+    echo "Finished. Output saved to: $out" >&2
+}
+
+if [[ -n "$MONITOR_MINUTES" ]]; then
+    monitor
+    exit 0
+fi
+
 {
     echo "Hadoop capacity audit: collected output"
     echo "Host: $(hostname -f 2>/dev/null || hostname)"
@@ -118,8 +186,10 @@ valid_hdfs_path() { [[ "$1" =~ ^(hdfs://[A-Za-z0-9._:-]+)?/[A-Za-z0-9._/=:@+,-]*
     run "ip -br link"
     run "ip -br addr"
     run "cat /proc/net/bonding/* 2>/dev/null || echo 'No bonded interfaces'"
-    run "for i in \$(ls /sys/class/net | grep -v '^lo$'); do echo \"--- \$i\"; ethtool \$i 2>/dev/null | grep -E 'Speed|Duplex|Link detected'; done"
+    run "for i in \$(ls /sys/class/net | grep -v '^lo$'); do echo \"--- \$i\"; ethtool \$i 2>/dev/null | grep -E 'Supported ports|Port:|Speed|Duplex|Link detected'; ethtool -i \$i 2>/dev/null | grep -E 'driver|bus-info'; done"
+    run "lspci | grep -iE 'ethernet|network'"
     run "dmidecode -t slot | grep -E 'Designation|Type|Current Usage'"
+    run "lldpctl 2>/dev/null || echo 'lldpctl not available (switch neighbour details not collected)'"
 
     section "H6 Local disk usage and temporary file locations"
     run "df -hT"
@@ -133,6 +203,11 @@ valid_hdfs_path() { [[ "$1" =~ ^(hdfs://[A-Za-z0-9._:-]+)?/[A-Za-z0-9._/=:@+,-]*
     run "nproc"
     run "grep -A1 -E 'yarn.nodemanager.resource.memory-mb|yarn.nodemanager.resource.cpu-vcores|yarn.scheduler.maximum-allocation-mb' $HADOOP_CONF_DIR/yarn-site.xml"
     run "jps 2>/dev/null || ps -eo args | grep -oE '(NameNode|DataNode|ResourceManager|NodeManager|HiveServer2|HiveMetaStore)' | sort -u"
+
+    section "H8 Memory modules and slots"
+    run "dmidecode -t memory | grep -E '^\\s+(Size|Locator|Type|Speed|Configured Memory Speed|Part Number):' | grep -vE 'Bank Locator|Error'"
+    run "echo \"Slots filled: \$(dmidecode -t 17 | grep -cE '^\\s+Size: [0-9]')  Slots empty: \$(dmidecode -t 17 | grep -cE '^\\s+Size: No Module')\""
+    run "dmidecode -t 16 | grep -E 'Maximum Capacity|Number Of Devices'"
 
     if [[ $CLUSTER -eq 1 ]]; then
         section "C1 HDFS capacity and replication"
